@@ -1,7 +1,8 @@
 'use client'
 
 import { useState, useEffect } from 'react'
-import { Upload, Key, MessageSquare, Wand2, Download, Save, Trash2 } from 'lucide-react'
+import { Upload, Key, MessageSquare, Wand2, Download, Save, Trash2, X, ZoomIn, ExternalLink } from 'lucide-react'
+import { fal } from '@fal-ai/client'
 
 interface CachedData {
   apiKey: string
@@ -17,6 +18,7 @@ export default function Home() {
   const [processing, setProcessing] = useState(false)
   const [progress, setProgress] = useState('')
   const [results, setResults] = useState<{ filename: string; url: string; seed: number }[]>([])
+  const [selectedImage, setSelectedImage] = useState<{ url: string; filename: string } | null>(null)
 
   useEffect(() => {
     // Load cached data from localStorage
@@ -46,58 +48,101 @@ export default function Home() {
     setFiles(uploadedFiles)
   }
 
-  const uploadToFal = async (file: File): Promise<string> => {
-    const formData = new FormData()
-    formData.append('file', file)
-    
-    const response = await fetch('https://api.fal.ai/upload', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Key ${apiKey}`
-      },
-      body: formData
+  const getImageDimensions = (file: File): Promise<{ width: number; height: number }> => {
+    return new Promise((resolve, reject) => {
+      const img = new Image()
+      img.onload = () => {
+        URL.revokeObjectURL(img.src) // Clean up
+        resolve({ width: img.width, height: img.height })
+      }
+      img.onerror = () => {
+        URL.revokeObjectURL(img.src) // Clean up
+        reject(new Error('Could not load image dimensions'))
+      }
+      img.src = URL.createObjectURL(file)
     })
-    
-    if (!response.ok) {
-      throw new Error('Upload failed')
+  }
+
+  const uploadToFal = async (file: File): Promise<string> => {
+    try {
+      // Use manual upload since fal.upload might not exist
+      const formData = new FormData()
+      formData.append('file', file)
+      
+      const response = await fetch('https://api.fal.ai/upload', {
+        method: 'POST',
+        headers: {
+          'Authorization': `Key ${apiKey}`
+        },
+        body: formData
+      })
+      
+      if (!response.ok) {
+        throw new Error('Upload failed')
+      }
+      
+      const data = await response.json()
+      if (!data.url) {
+        throw new Error('Upload response missing URL')
+      }
+      return data.url
+    } catch (error) {
+      throw new Error(`Upload failed: ${error instanceof Error ? error.message : 'Unknown error'}`)
     }
-    
-    const data = await response.json()
-    return data.url
   }
 
   const processImage = async (file: File, imageUrl: string) => {
-    const response = await fetch('https://api.fal.ai/subscriptions/fal-ai/flux-2/klein/9b/base/edit/lora', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Key ${apiKey}`,
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({
-        prompt,
-        guidance_scale: 5,
-        num_inference_steps: 28,
-        image_size: { width: 1024, height: 1024 },
-        num_images: 1,
-        acceleration: 'regular',
-        enable_safety_checker: false,
-        output_format: 'png',
-        image_urls: [imageUrl],
-        ...(lora && {
-          loras: [{
-            path: lora,
-            scale: 1
-          }]
-        })
-      })
-    })
+    const endpoint = lora 
+      ? "fal-ai/flux-2/klein/9b/base/edit/lora"
+      : "fal-ai/flux-2/klein/9b/edit"
     
-    if (!response.ok) {
-      throw new Error('Processing failed')
+    // Get actual image dimensions
+    let width, height
+    try {
+      const dimensions = await getImageDimensions(file)
+      width = dimensions.width
+      height = dimensions.height
+    } catch (error) {
+      throw new Error(`Could not read image dimensions: ${error instanceof Error ? error.message : 'Unknown error'}`)
     }
     
-    const data = await response.json()
-    return data
+    // Configure fal client with API key
+    fal.config({
+      credentials: apiKey
+    })
+    
+    const arguments_obj = {
+      prompt: prompt,
+      guidance_scale: 5,
+      num_inference_steps: 28,
+      image_size: {
+        width: width,
+        height: height
+      },
+      num_images: 1,
+      acceleration: "regular",
+      enable_safety_checker: false,
+      output_format: "png",
+      image_urls: [imageUrl],
+      ...(lora && {
+        loras: [{
+          path: lora,
+          scale: 1
+        }]
+      })
+    }
+    
+    const result = await fal.subscribe(endpoint, {
+      input: arguments_obj,
+      onQueueUpdate: (update) => {
+        if (update.status === "IN_PROGRESS") {
+          console.log("Processing:", update.logs)
+        }
+      },
+    })
+    
+    // The result should have the same structure as Python
+    return result.data || result
   }
 
   const processAllImages = async () => {
@@ -117,11 +162,13 @@ export default function Home() {
         
         const result = await processImage(file, imageUrl)
         
-        if (result.images && result.images.length > 0) {
+        // Handle both possible response structures
+        const responseData = result.data || result
+        if (responseData.images && responseData.images.length > 0) {
           setResults(prev => [...prev, {
             filename: file.name.replace(/\.[^/.]+$/, '_generated.png'),
-            url: result.images[0].url,
-            seed: result.seed || 0
+            url: responseData.images[0].url,
+            seed: responseData.seed || 0
           }])
         }
         
@@ -139,13 +186,34 @@ export default function Home() {
     }
   }
 
-  const downloadImage = (url: string, filename: string) => {
-    const a = document.createElement('a')
-    a.href = url
-    a.download = filename
-    document.body.appendChild(a)
-    a.click()
-    document.body.removeChild(a)
+  const downloadImage = async (url: string, filename: string) => {
+    try {
+      // Fetch the image at full resolution
+      const response = await fetch(url)
+      const blob = await response.blob()
+      
+      // Create download link
+      const downloadUrl = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = downloadUrl
+      a.download = filename
+      document.body.appendChild(a)
+      a.click()
+      document.body.removeChild(a)
+      
+      // Clean up
+      URL.revokeObjectURL(downloadUrl)
+    } catch (error) {
+      console.error('Download failed:', error)
+      // Fallback to direct link
+      const a = document.createElement('a')
+      a.href = url
+      a.download = filename
+      a.target = '_blank'
+      document.body.appendChild(a)
+      a.click()
+      document.body.removeChild(a)
+    }
   }
 
   const downloadAll = () => {
@@ -294,21 +362,47 @@ export default function Home() {
               <h2 className="text-xl font-semibold mb-4">Results</h2>
               <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
                 {results.map((result, index) => (
-                  <div key={index} className="border rounded-lg overflow-hidden">
-                    <img
-                      src={result.url}
-                      alt={result.filename}
-                      className="w-full h-48 object-cover"
-                    />
+                  <div key={index} className="border rounded-lg overflow-hidden group">
+                    <div className="relative">
+                      <img
+                        src={result.url}
+                        alt={result.filename}
+                        className="w-full h-48 object-cover"
+                      />
+                      <div className="absolute inset-0 bg-black bg-opacity-0 group-hover:bg-opacity-50 transition-all duration-200 flex items-center justify-center opacity-0 group-hover:opacity-100">
+                        <button
+                          onClick={() => setSelectedImage({ url: result.url, filename: result.filename })}
+                          className="p-2 bg-white rounded-full hover:bg-gray-100 mr-2"
+                        >
+                          <ZoomIn className="w-4 h-4" />
+                        </button>
+                        <a
+                          href={result.url}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="p-2 bg-white rounded-full hover:bg-gray-100"
+                        >
+                          <ExternalLink className="w-4 h-4" />
+                        </a>
+                      </div>
+                    </div>
                     <div className="p-4">
                       <p className="text-sm font-medium truncate">{result.filename}</p>
                       <p className="text-xs text-gray-500">Seed: {result.seed}</p>
-                      <button
-                        onClick={() => downloadImage(result.url, result.filename)}
-                        className="mt-2 w-full px-3 py-1 bg-blue-500 text-white text-sm rounded hover:bg-blue-600"
-                      >
-                        Download
-                      </button>
+                      <div className="mt-2 flex gap-2">
+                        <button
+                          onClick={() => downloadImage(result.url, result.filename)}
+                          className="flex-1 px-3 py-1 bg-blue-500 text-white text-sm rounded hover:bg-blue-600"
+                        >
+                          Download
+                        </button>
+                        <button
+                          onClick={() => setSelectedImage({ url: result.url, filename: result.filename })}
+                          className="px-3 py-1 bg-gray-500 text-white text-sm rounded hover:bg-gray-600"
+                        >
+                          View
+                        </button>
+                      </div>
                     </div>
                   </div>
                 ))}
@@ -317,6 +411,46 @@ export default function Home() {
           )}
         </div>
       </div>
+
+      {/* Full Resolution Modal */}
+      {selectedImage && (
+        <div className="fixed inset-0 bg-black bg-opacity-75 z-50 flex items-center justify-center p-4">
+          <div className="relative max-w-6xl max-h-full">
+            <button
+              onClick={() => setSelectedImage(null)}
+              className="absolute -top-12 right-0 p-2 text-white hover:text-gray-300"
+            >
+              <X className="w-6 h-6" />
+            </button>
+            <img
+              src={selectedImage.url}
+              alt={selectedImage.filename}
+              className="max-w-full max-h-full object-contain"
+            />
+            <div className="absolute bottom-0 left-0 right-0 bg-black bg-opacity-75 text-white p-4">
+              <p className="text-sm font-medium mb-2">{selectedImage.filename}</p>
+              <div className="flex gap-2">
+                <button
+                  onClick={() => downloadImage(selectedImage.url, selectedImage.filename)}
+                  className="px-4 py-2 bg-blue-500 text-white rounded hover:bg-blue-600 flex items-center gap-2"
+                >
+                  <Download className="w-4 h-4" />
+                  Download Full Resolution
+                </button>
+                <a
+                  href={selectedImage.url}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="px-4 py-2 bg-gray-500 text-white rounded hover:bg-gray-600 flex items-center gap-2"
+                >
+                  <ExternalLink className="w-4 h-4" />
+                  Open in New Tab
+                </a>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }
