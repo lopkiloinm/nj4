@@ -17,6 +17,9 @@
 /.next/
 /out/
 
+# but keep .nojekyll
+!.nojekyll
+
 # production
 /build
 
